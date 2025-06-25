@@ -1,0 +1,328 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # DATABASE SERVICES
+  # ============================================================================
+  
+  # PostgreSQL Database
+  postgres:
+    container_name: itdel-postgres
+    image: postgres:16.4
+    environment:
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=chatbot
+    volumes:
+      - itdel-chatbot-data:/var/lib/postgresql/data
+    ports:
+      - "35432:5432"
+    restart: unless-stopped
+    networks:
+      - itdel-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d chatbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ============================================================================
+  # MILVUS VECTOR DATABASE STACK
+  # ============================================================================
+  
+  # etcd for Milvus
+  etcd:
+    container_name: milvus-gpu-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+    volumes:
+      - /home/ilham/milvus_database/volumes/etcd:/etcd
+    ports:
+      - "34379:2379"
+    command: etcd --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - itdel-network
+
+  # MinIO Object Storage for Milvus
+  minio:
+    container_name: milvus-gpu-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "34001:9001"
+      - "34000:9000"
+    volumes:
+      - /home/ilham/milvus_database/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - itdel-network
+
+  # Milvus Vector Database
+  milvus:
+    container_name: milvus-gpu-standalone
+    image: milvusdb/milvus:v2.4.15-gpu
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      COMMON_STORAGETYPE: local
+    volumes:
+      - /home/ilham/milvus_database/volumes/milvus:/var/lib/milvus
+    ports:
+      - "33530:19530"
+      - "34091:9091"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["2"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      - etcd
+      - minio
+    restart: unless-stopped
+    networks:
+      - itdel-network
+
+  # Attu GUI for Milvus
+  attu-gui:
+    container_name: milvus-gpu-attu-gui
+    image: zilliz/attu:v2.4.3
+    environment:
+      - MILVUS_URL=milvus:19530
+    ports:
+      - "33991:3000"
+    depends_on:
+      - milvus
+    restart: unless-stopped
+    networks:
+      - itdel-network
+
+  # ============================================================================
+  # AI/ML SERVICES
+  # ============================================================================
+  
+  # VLLM Server for LLM
+  vllm:
+    container_name: vllm-qwen3-32b-awq-tp2
+    image: vllm/vllm-openai:v0.8.5.post1
+    volumes:
+      - /raid/LLMs/model/Qwen3-32B-AWQ/:/qwen3-32b
+    ports:
+      - "33315:8000"
+    ipc: host
+    shm_size: "16G"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["GPU-b4320702-beef-062e-ced6-c7bcc94a5c92", "GPU-6d8f4966-a52d-bbf8-b9dc-6d73c8a2c76d"]
+    command: >
+      --model /qwen3-32b 
+      --trust-remote-code 
+      --served-model-name epsindo.ai/qwen2.5-14b-inst-awq 
+      --gpu-memory-utilization 0.9 
+      --enable-auto-tool-choice 
+      --tool-call-parser hermes 
+      --tensor-parallel-size 2
+    restart: unless-stopped
+    networks:
+      - itdel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+
+  # Infinity Embeddings Server
+  infinity-embed:
+    container_name: infinity-stella-embed
+    image: michaelf34/infinity:0.0.75
+    volumes:
+      - /raid/LLMs/model/stella_en_1.5B_v5/:/models
+    ports:
+      - "33325:33325"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["2"]
+    command: >
+      v2 
+      --model-id "/models" 
+      --served-model-name stella-en-1.5B 
+      --port 33325
+    restart: unless-stopped
+    networks:
+      - itdel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:33325/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================================================
+  # APPLICATION SERVICES
+  # ============================================================================
+  
+  # Backend API
+  api:
+    container_name: itdel-chatbot-api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "35430:35430"
+    environment:
+      # App Settings
+      - APP_NAME=ITDel Chatbot API
+      
+      # JWT Settings
+      - SECRET_KEY=itdel_super_secure_jwt_secret_key_minimum_32_characters_long_change_this_in_production
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=2400
+      
+      # Database Settings
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=chatbot
+      
+      # LLM Settings
+      - OPENAI_API_KEY=EMPTY
+      - OPENAI_API_BASE=http://vllm:8000/v1
+      - LLM_MODEL=epsindo.ai/qwen2.5-14b-inst-awq
+      - LLM_MAX_TOKENS=2000
+      - LLM_TEMPERATURE=0.1
+      - LLM_TOP_P=0.95
+      - LLM_CONFIG_NAME=Production LLM Configuration
+      
+      # MinIO Settings
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_DEFAULT_BUCKET=documents
+      - MINIO_SECURE=false
+      
+      # RAG Settings
+      - REMOTE_EMBEDDER_URL=http://infinity-embed:33325/embeddings
+      - MILVUS_URI=http://milvus:19530
+      - DEFAULT_COLLECTION=default_collection
+      - RETRIEVER_TOP_K=10
+      
+      # Infinity Embeddings Settings
+      - INFINITY_EMBEDDINGS_MODEL=stella-en-1.5B
+      - INFINITY_API_URL=http://infinity-embed:33325
+      
+      # Super Admin Configuration
+      - SUPER_ADMIN_USERNAME=admin
+      - SUPER_ADMIN_PASSWORD=itdel_admin_password_change_this
+      - SUPER_ADMIN_EMAIL=admin@itdel.ac.id
+      - SUPER_ADMIN_FULL_NAME=ITDel System Administrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      milvus:
+        condition: service_started
+      vllm:
+        condition: service_healthy
+      infinity-embed:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./api/logs:/app/logs
+    networks:
+      - itdel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:35430/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend UI
+  ui:
+    container_name: itdel-chatbot-ui
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    ports:
+      - "33332:3000"
+    environment:
+      # Backend API URL
+      - API_BASE_URL=http://api:35430
+      
+      # Production settings
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      
+      # Container settings
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - itdel-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+
+volumes:
+  itdel-chatbot-data:
+    external: true
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  itdel-network:
+    name: itdel-network
+    driver: bridge
